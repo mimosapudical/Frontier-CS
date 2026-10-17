@@ -6,61 +6,49 @@ import traceback
 import importlib.util
 import pandas as pd
 import gc
-from typing import Any, Mapping, Tuple, List, Optional
+import math
+from typing import Any, Mapping, Tuple
 
 
-def _is_number(x: Any) -> bool:
-    try:
-        float(x)
-        return True
-    except (TypeError, ValueError):
-        return False
+LAMBDA = 150.0
 
 
-def _to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    if x is None:
-        return default
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return default
+def _model_stats(query: Mapping[str, Any], model: str) -> Tuple[float, float, float]:
+    """Return normalized quality, cost and utility using one scoring definition.
 
-
-def _is_correct_value(v: Any) -> bool:
+    RouterBench includes normalized ratings, not just binary correctness.
+    Reject malformed data rather than turning it into free cost or full credit.
     """
-    Treat >0 numeric as correct; otherwise truthy strings/bools as correct.
-    """
-    if _is_number(v):
+    values = []
+    for key, label in [(model, "correctness"), (f"{model}|total_cost", "cost")]:
         try:
-            return float(v) > 0.0
-        except Exception:
-            return False
-    return bool(v)
+            value = float(query.get(key))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {label} for {model}") from exc
+        if not math.isfinite(value) or value < 0 or (label == "correctness" and value > 1):
+            raise ValueError(f"Invalid {label} for {model}: {value}")
+        values.append(value)
+    quality, cost = values
+    return quality, cost, quality - LAMBDA * cost
 
 
 def compute_oracle_stats(query: Mapping[str, Any],
                          tier_to_model: Mapping[str, str]) -> Tuple[str, float]:
-    """
-    Pick the lowest-cost model (among tier_to_model.values()) that answered correctly.
+    """Maximize the same quality-minus-cost utility awarded to a candidate.
+
+    Break utility ties by cost, then model name, independently of tier ordering.
+    An empty candidate set retains the legacy sentinel; all-zero quality does
+    not: the task requires choosing a model and paying its cost even then.
     """
     best_model = "no_model_correct"
-    best_cost = float("inf")
-
+    best_cost = 0.0
+    best_key = None
     for model in tier_to_model.values():
-        if not _is_correct_value(query.get(model, 0.0)):
-            continue
-
-        cost_key = f"{model}|total_cost"
-        cost = _to_float(query.get(cost_key, None), default=None)
-        if cost is None:
-            continue
-
-        if cost < best_cost:
-            best_cost = cost
-            best_model = model
-
-    if best_model == "no_model_correct":
-        return "no_model_correct", 0.0
+        _, cost, utility = _model_stats(query, model)
+        key = (-utility, cost, model)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_model, best_cost = model, cost
     return best_model, best_cost
 
 
@@ -83,7 +71,6 @@ class Evaluator:
         ]
 
     def evaluate(self, solution_module_path: str) -> dict:
-        LAMBDA = 150.0
         CANDIDATE_MODELS = ["cheap", "mid", "expensive"]
 
         # update based on dataset config
@@ -106,6 +93,7 @@ class Evaluator:
         total_queries = 0
         total_correct, oracle_correct = 0, 0
         total_cost, oracle_cost = 0.0, 0.0
+        total_utility, oracle_utility = 0.0, 0.0
         for csv_path in self.trace_files:
             dataset_name = os.path.basename(csv_path)
             
@@ -123,34 +111,20 @@ class Evaluator:
                 if chosen_tier not in CANDIDATE_MODELS:
                     chosen_tier = "cheap"
                 
-                # obtain cost
                 model_name = TIER_TO_MODEL[chosen_tier]
-                cost_col = f"{model_name}|total_cost"
-                try:
-                    cost = float(row[cost_col])
-                except Exception:
-                    cost = 0.0
-                
-                # obtain correctness
-                # oracle = row.get("oracle_model_to_route_to", "")
-                # oracle_cost_sample = float(row.get(f"{oracle}|total_cost", 0.0))
-                oracle, oracle_cost_sample = compute_oracle_stats(row, TIER_TO_MODEL)
-                if isinstance(oracle, str) and oracle.strip() == "no_model_correct":
-                    correct = 0
-                    cost = 0.0
-                    oracle_correct_sample = 0
-                else:
-                    oracle_correct_sample = 1
-                    try:
-                        correct = int(float(row[model_name]))
-                    except Exception:
-                        correct = 0
-                
+                correct, cost, utility = _model_stats(row, model_name)
+                oracle, _ = compute_oracle_stats(row, TIER_TO_MODEL)
+                oracle_correct_sample, oracle_cost_sample, oracle_utility_sample = (
+                    _model_stats(row, oracle)
+                )
+
                 total_queries += 1
                 total_correct += correct
                 oracle_correct += oracle_correct_sample
                 total_cost += cost
                 oracle_cost += oracle_cost_sample
+                total_utility += utility
+                oracle_utility += oracle_utility_sample
             
             # Release memory
             del df
@@ -161,10 +135,10 @@ class Evaluator:
             return {"score": 0.0, "runs_successfully": 0.0, "error": "Empty dataset"}
         accuracy = total_correct / total_queries
         avg_cost = total_cost / total_queries
-        raw_score = accuracy - (LAMBDA * avg_cost)
+        raw_score = total_utility / total_queries
         oracle_accuracy = oracle_correct / total_queries
         oracle_avg_cost = oracle_cost / total_queries
-        oracle_raw_score = oracle_accuracy - (LAMBDA * oracle_avg_cost)
+        oracle_raw_score = oracle_utility / total_queries
         score_unbounded = (raw_score / oracle_raw_score) * 100 if oracle_raw_score > 0 else 0.0
         score = score_unbounded
 

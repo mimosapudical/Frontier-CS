@@ -68,7 +68,7 @@ One example mapping of routing tiers to concrete LLMs is:
 - "mid": "mistralai/mixtral-8x7b-chat",
 - "expensive": "gpt-4-1106-preview".
 
-Scoring (0-100)
+Scoring (oracle = 100)
 --------
 The router is evaluated on a fixed set of queries.
 
@@ -78,12 +78,23 @@ For each query:
 - Accuracy and cost are accumulated.
 
 Let:
-- accuracy = fraction of queries answered correctly
+- accuracy = mean normalized performance of the selected models (including fractional credit)
 - avg_cost = average inference cost per query
 
 The raw score is computed as: raw_score = accuracy − λ × avg_cost, where λ = 150.0. Naively guessing "cheap"/"mid"/"expensive" all the time is expected to yield a uniformly low score.
 
-The final benchmark score is normalized to the range [0, 100], where the oracle router always gets 100.
+The oracle selects the model maximizing the same per-query utility:
+`utility = performance - 150.0 * cost`. Ties are broken by lower cost, then
+model name. It chooses among the same candidate models as the solution, even
+when every model has zero performance; the selected cost is still charged.
+
+The final score is `100 * raw_score / oracle_raw_score` when the oracle raw
+score is positive, so a perfect oracle policy gets 100. Negative candidate
+utilities can produce negative scores; there is no clipping to [0, 100]. If the
+oracle raw score is nonpositive, the evaluator returns 0 rather than dividing
+by a nonpositive normalizer. Empty evaluation data is an evaluation error.
+Missing, nonnumeric, nonfinite or out-of-range performance values and missing,
+nonnumeric, nonfinite or negative costs are rejected as invalid data.
 
 Reference Dataset
 --------
@@ -107,10 +118,22 @@ df = pd.read_csv(data_path)
 - `sample_id`: Unique identifier (e.g., "mmlu-sociology.val.78")
 - `prompt`: The query text (may contain newlines, escaped as \n)
 - `eval_name`: Dataset/task name (e.g., "mbpp", "mmlu-sociology", "hellaswag")
-- `{model_name}`: Correctness score (0.0 or 1.0) for each LLM
+- `{model_name}`: Normalized task performance in [0, 1] for each LLM, including fractional values (e.g., 0.25, 0.5, 0.75). Binary outcomes remain 0 or 1.
 - `{model_name}|model_response`: The actual response text from each LLM
 - `{model_name}|total_cost`: Inference cost for each LLM
-- `oracle_model_to_route_to`: The optimal model for this query
+- `oracle_model_to_route_to`: Source-dataset quality-first oracle over the full source model pool; not the cost-penalized benchmark oracle, which is recomputed over the candidate tiers.
+
+**Performance provenance:**
+The data comes from [RouterBench](https://arxiv.org/html/2403.12031v2), whose
+Appendix A.4 specifies binary 0/1 outcomes and ratings normalized to [0, 1].
+Its [converter](https://github.com/withmartian/routerbench/blob/cc67d1008bd8f3cf1e8040cc3ba4034d31b93c0c/convertors/martian_evals_convertor.py#L123-L153)
+retains numeric metrics and maps rating choices A–E to 1, 0.75, 0.5, 0.25, 0.
+The [wide-format conversion](https://github.com/withmartian/routerbench/blob/cc67d1008bd8f3cf1e8040cc3ba4034d31b93c0c/convertors/common.py#L59-L64)
+also averages repeated performance entries. These values measure supplied task
+quality; a value of 0.75 is not established to be a calibrated 75% probability
+of a correct answer. The evaluator preserves this quality credit without
+thresholding or integer truncation. The `accuracy` result key is retained for
+compatibility and denotes mean normalized performance.
 
 **Models in dataset:**
 - WizardLM/WizardLM-13B-V1.2
